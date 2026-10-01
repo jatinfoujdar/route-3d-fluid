@@ -111,6 +111,74 @@ struct RouteScene {
         let total = max(cum.last ?? 1, 0.001)
         let ts = cum.map { $0 / total }
         
+        // MARK: Fluid Wall (Shadow beneath route)
+        let wallMat = SCNMaterial()
+        wallMat.lightingModel = .constant
+        wallMat.diffuse.contents = UIColor.white
+        wallMat.isDoubleSided = true
+        wallMat.blendMode = .add
+        wallMat.writesToDepthBuffer = false
+        wallMat.readsFromDepthBuffer = false
+        
+        wallMat.setValue(NSNumber(value: 0.0), forKey: "progress")
+        wallMat.setValue(NSNumber(value: 0.0), forKey: "time")
+        wallMat.setValue(NSValue(scnVector4: palette.vec4(palette.wallWarm)), forKey: "warmColor")
+        wallMat.setValue(NSValue(scnVector4: palette.vec4(palette.wallCool)), forKey: "coolColor")
+        
+        wallMat.shaderModifiers = [
+            .fragment: """
+            uniform float progress;
+            uniform float time;
+            uniform float4 warmColor;
+            uniform float4 coolColor;
+            
+            float t = _surface.diffuseTexcoord.x;  // Along path (0...1)
+            float d = _surface.diffuseTexcoord.y;  // Depth (0 = route top, 1 = floor)
+            
+            // Discard if past progress
+            if (t > progress) {
+                discard_fragment();
+            }
+            
+            // Fluid morphing with wavy edges
+            float waveFreq = 5.0;
+            float waveAmp = 0.12;
+            float waveMorph = sin(t * waveFreq + time * 2.2) * waveAmp + cos(t * waveFreq * 0.6 + time * 1.5) * waveAmp * 0.4;
+            
+            // Soft vertical falloff - brighter near the line, fades at floor
+            float morphedD = d + waveMorph * 0.5;
+            float verticalFade = pow(1.0 - morphedD, 1.5);
+            
+            // Edge boost - strong white core right under the ribbon
+            float edgeBoost = pow(1.0 - morphedD, 3.8);
+            
+            // Turbulent glow patterns
+            float turbulence = sin(t * 2.5 + time * 1.5) * 0.25 + cos(d * 1.8 + time * 0.9) * 0.15;
+            
+            // Color drift - warm and cool shift
+            float drift = 0.5 + 0.5 * sin(time * 0.5 + t * 1.2);
+            float3 tint = warmColor.rgb * (1.0 - drift * 0.6) + coolColor.rgb * (0.4 + drift * 0.6);
+            
+            // Add base color blend
+            tint += 0.12 * mix(warmColor.rgb, coolColor.rgb, drift);
+            
+            // Keep a little base color so edge-on sections don't go black
+            tint += 0.08 * mix(warmColor.rgb, coolColor.rgb, 0.5);
+            
+            // Final color - push the top edge toward pure white
+            float3 col = mix(tint, float3(1.0), edgeBoost * 0.65);
+            float a = 0.8 * verticalFade * (0.6 + turbulence);
+            
+            _output.color = float4(col * a, a);
+            """
+        ]
+        
+        let wallGeometry = makeWall(points: points, ts: ts)
+        wallGeometry.materials = [wallMat]
+        let wallNode = SCNNode(geometry: wallGeometry)
+        wallNode.renderingOrder = -1
+        routeCenterNode.addChildNode(wallNode)
+        
         // MARK: Fluid Stroke (Main Visual)
         let fluidMat = SCNMaterial()
         fluidMat.lightingModel = .constant
@@ -244,6 +312,8 @@ struct RouteScene {
             let r = min(Double(elapsed) / traceTime, 1)
             let eased = Float(r * r * (3 - 2 * r))
             
+            wallMat.setValue(NSNumber(value: eased), forKey: "progress")
+            wallMat.setValue(NSNumber(value: elapsed), forKey: "time")
             fluidMat.setValue(NSNumber(value: eased), forKey: "progress")
             fluidMat.setValue(NSNumber(value: elapsed), forKey: "time")
             
@@ -268,7 +338,7 @@ struct RouteScene {
             centerNode: routeCenterNode,
             dotNode: dotNode,
             dotAnimationNode: dotNode,
-            wallNode: fluidNode,
+            wallNode: wallNode,
             animationDuration: cycle
         )
     }
@@ -290,6 +360,54 @@ struct RouteScene {
             out = next
         }
         return out
+    }
+    
+    private static func makeWall(points: [SCNVector3], ts: [Float]) -> SCNGeometry {
+        var vertices: [SCNVector3] = []
+        var normals: [SCNVector3] = []
+        var uvs: [CGPoint] = []
+        var indices: [Int32] = []
+        
+        let floorY: Float = -wallDepth
+        let n = points.count
+        
+        for (i, p) in points.enumerated() {
+            let a = points[max(i - 1, 0)]
+            let b = points[min(i + 1, n - 1)]
+            
+            var nx = -(b.z - a.z)
+            var nz = (b.x - a.x)
+            let len = max(sqrt(nx * nx + nz * nz), 1e-6)
+            nx /= len
+            nz /= len
+            
+            // slight vertical bias helps lighting on climbs
+            let dy = (b.y - a.y) * 0.35
+            var normal = SCNVector3(nx, dy, nz)
+            let nlen = max(sqrt(normal.x*normal.x + normal.y*normal.y + normal.z*normal.z), 1e-6)
+            normal = SCNVector3(normal.x/nlen, normal.y/nlen, normal.z/nlen)
+            
+            vertices.append(p)
+            vertices.append(SCNVector3(p.x, floorY, p.z))
+            normals += [normal, normal]
+            
+            uvs.append(CGPoint(x: CGFloat(ts[i]), y: 0))
+            uvs.append(CGPoint(x: CGFloat(ts[i]), y: 1))
+            
+            if i < n - 1 {
+                let a0 = Int32(2 * i)
+                indices += [a0, a0 + 1, a0 + 2, a0 + 2, a0 + 1, a0 + 3]
+            }
+        }
+        
+        return SCNGeometry(
+            sources: [
+                SCNGeometrySource(vertices: vertices),
+                SCNGeometrySource(normals: normals),
+                SCNGeometrySource(textureCoordinates: uvs)
+            ],
+            elements: [SCNGeometryElement(indices: indices, primitiveType: .triangles)]
+        )
     }
     
     private static func makeTube(points: [SCNVector3], ts: [Float], radius: Float, sides: Int) -> SCNGeometry {

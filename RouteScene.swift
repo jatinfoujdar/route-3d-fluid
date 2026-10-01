@@ -82,6 +82,7 @@ struct FluidRouteView: View {
 
                 guard !drawPoints.isEmpty else { return }
 
+                // Draw layered fluid strokes
                 for layer in 0..<6 {
                     let amplitude = 1.8 + Double(layer) * 1.1
                     let phase = t * (0.8 + Double(layer) * 0.18)
@@ -90,31 +91,23 @@ struct FluidRouteView: View {
                     let alpha = 0.18 + Double(6 - layer) * 0.09
                     let width = 12 + CGFloat(layer) * 5.5
 
-                    graphicsContext.stroke(
-                        path,
-                        with: .color(colorForLayer(layer: layer, alpha: alpha)),
-                        lineWidth: width
-                    )
+                    let color = colorForLayer(layer: layer, alpha: alpha)
+                    graphicsContext.stroke(path, with: .color(color), lineWidth: width)
 
-                    graphicsContext.stroke(
-                        path,
-                        with: .color(colorForLayer(layer: layer, alpha: 0.8)),
-                        lineWidth: max(1.2, width * 0.18)
-                    )
+                    let brightColor = colorForLayer(layer: layer, alpha: 0.8)
+                    graphicsContext.stroke(path, with: .color(brightColor), lineWidth: max(1.2, width * 0.18))
                 }
 
+                // Core bright line
                 let corePath = makeFluidPath(points: drawPoints, amplitude: 1.2, phase: t * 1.1)
-                graphicsContext.stroke(
-                    corePath,
-                    with: .color(palette.highlight.opacity(0.98)),
-                    lineWidth: 1.8
-                )
+                graphicsContext.stroke(corePath, with: .color(palette.highlight.opacity(0.98)), lineWidth: 1.8)
 
-                let end = drawPoints.last ?? CGPoint(x: size.width * 0.5, y: size.height * 0.5)
-                let glowDot = Circle().fill(palette.highlight.opacity(0.9))
-                    .frame(width: 10, height: 10)
-                    .position(x: end.x, y: end.y)
-                graphicsContext.draw(glowDot, at: end)
+                // End dot
+                if let end = drawPoints.last {
+                    var dotPath = Path()
+                    dotPath.addEllipse(in: CGRect(x: end.x - 5, y: end.y - 5, width: 10, height: 10))
+                    graphicsContext.fill(dotPath, with: .color(palette.highlight.opacity(0.9)))
+                }
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
             .background(palette.backgroundColor)
@@ -123,20 +116,17 @@ struct FluidRouteView: View {
 
     private func colorForLayer(layer: Int, alpha: Double) -> Color {
         let t = Double(layer) / 5.0
-        let warm = palette.warm.opacity(alpha)
-        let cool = palette.cool.opacity(alpha)
-        return mixColor(from: warm, to: cool, t: t)
-    }
-
-    private func mixColor(from left: Color, to right: Color, t: Double) -> Color {
         let clamped = max(0, min(1, t))
-        let start = left.sRGBColor
-        let end = right.sRGBColor
-
-        let r = Double(start.red) + (Double(end.red) - Double(start.red)) * clamped
-        let g = Double(start.green) + (Double(end.green) - Double(start.green)) * clamped
-        let b = Double(start.blue) + (Double(end.blue) - Double(start.blue)) * clamped
-        return Color(red: r, green: g, blue: b)
+        
+        // Interpolate between warm and cool
+        let warmRGB = (1.0, 0.42, 0.22)
+        let coolRGB = (0.25, 0.80, 0.85)
+        
+        let r = warmRGB.0 + (coolRGB.0 - warmRGB.0) * clamped
+        let g = warmRGB.1 + (coolRGB.1 - warmRGB.1) * clamped
+        let b = warmRGB.2 + (coolRGB.2 - warmRGB.2) * clamped
+        
+        return Color(red: r, green: g, blue: b, opacity: alpha)
     }
 
     private func makeFluidPath(points: [CGPoint], amplitude: Double, phase: Double) -> Path {
@@ -158,7 +148,8 @@ struct FluidRouteView: View {
             let normalX = -sin(angle)
             let normalY = cos(angle)
 
-            let wave = sin(p * 26.0 + phase * 1.8) * amplitude + cos(p * 14.0 - phase * 1.2) * (amplitude * 0.55)
+            let wave = sin(p * 26.0 + phase * 1.8) * amplitude 
+                     + cos(p * 14.0 - phase * 1.2) * (amplitude * 0.55)
             let offsetX = normalX * CGFloat(wave)
             let offsetY = normalY * CGFloat(wave)
 
@@ -169,11 +160,7 @@ struct FluidRouteView: View {
         path.move(to: first)
 
         for i in 1..<warped.count {
-            let prev = warped[i - 1]
-            let current = warped[i]
-            let mid = CGPoint(x: (prev.x + current.x) * 0.5, y: (prev.y + current.y) * 0.5)
-            path.addQuadCurve(to: mid, control: prev)
-            path.addQuadCurve(to: current, control: mid)
+            path.addLine(to: warped[i])
         }
 
         return path

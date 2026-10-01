@@ -1,40 +1,47 @@
 import SwiftUI
 import CoreLocation
+import MetalKit
+import simd
 
 struct RoutePalette {
     static let dark = RoutePalette(
-        backgroundColor: Color.black,
-        warm: Color(red: 1.00, green: 0.42, blue: 0.22),
-        cool: Color(red: 0.25, green: 0.80, blue: 0.85),
-        highlight: Color.white,
-        glow: Color.white.opacity(0.92)
+        backgroundColor: .black,
+        warm: SIMD4<Float>(1.00, 0.42, 0.22, 1.0),
+        cool: SIMD4<Float>(0.25, 0.80, 0.85, 1.0),
+        white: SIMD4<Float>(1.0, 1.0, 1.0, 1.0)
     )
-    
+
     static let pastel = RoutePalette(
-        backgroundColor: Color.black,
-        warm: Color(red: 1.00, green: 0.70, blue: 0.55),
-        cool: Color(red: 0.65, green: 0.80, blue: 0.98),
-        highlight: Color.white,
-        glow: Color.white.opacity(0.92)
+        backgroundColor: .black,
+        warm: SIMD4<Float>(1.00, 0.70, 0.55, 1.0),
+        cool: SIMD4<Float>(0.65, 0.80, 0.98, 1.0),
+        white: SIMD4<Float>(1.0, 1.0, 1.0, 1.0)
     )
-    
-    static let mono = RoutePalette(
-        backgroundColor: Color.black,
-        warm: Color(red: 0.90, green: 0.92, blue: 1.0),
-        cool: Color(red: 0.65, green: 0.78, blue: 1.0),
-        highlight: Color.white,
-        glow: Color.white.opacity(0.92)
-    )
-    
+
     let backgroundColor: Color
-    let warm: Color
-    let cool: Color
-    let highlight: Color
-    let glow: Color
+    let warm: SIMD4<Float>
+    let cool: SIMD4<Float>
+    let white: SIMD4<Float>
+}
+
+struct RouteVertex {
+    var position: SIMD3<Float>
+    var uv: SIMD2<Float>
+}
+
+struct RouteUniforms {
+    var warm: SIMD4<Float>
+    var cool: SIMD4<Float>
+    var time: Float
+}
+
+struct RoutePoint {
+    var x: Float
+    var y: Float
 }
 
 struct RouteScene {
-    static func build(from coordinates: [CLLocation], palette: RoutePalette = .dark) -> [CGPoint] {
+    static func build(from coordinates: [CLLocation], palette: RoutePalette = .dark) -> [SIMD2<Float>] {
         guard !coordinates.isEmpty else { return [] }
 
         let latitudes = coordinates.map { $0.coordinate.latitude }
@@ -48,17 +55,15 @@ struct RouteScene {
         let latRange = max(latMax - latMin, 0.0001)
         let lonRange = max(lonMax - lonMin, 0.0001)
 
-        let points = coordinates.map { coordinate -> CGPoint in
-            let nx = (coordinate.coordinate.longitude - lonMin) / lonRange
-            let ny = 1 - ((coordinate.coordinate.latitude - latMin) / latRange)
-            return CGPoint(x: nx, y: ny)
+        return coordinates.map { coordinate in
+            let nx = Float((coordinate.coordinate.longitude - lonMin) / lonRange)
+            let ny = Float(1.0 - ((coordinate.coordinate.latitude - latMin) / latRange))
+            return SIMD2<Float>(nx, ny)
         }
-
-        return points
     }
 }
 
-struct FluidRouteView: View {
+struct PRAXISRouteView: UIViewRepresentable {
     let coordinates: [CLLocation]
     let palette: RoutePalette
 
@@ -67,111 +72,192 @@ struct FluidRouteView: View {
         self.palette = palette
     }
 
-    var body: some View {
-        TimelineView(.animation) { context in
-            let t = context.date.timeIntervalSinceReferenceDate
-            let routePoints = RouteScene.build(from: coordinates, palette: palette)
+    func makeUIView(context: Context) -> MTKView {
+        let view = MTKView(frame: .zero, device: MTLCreateSystemDefaultDevice())
+        view.device = MTLCreateSystemDefaultDevice()
+        view.clearColor = MTLClearColor(red: 0, green: 0, blue: 0, alpha: 1)
+        view.colorPixelFormat = .bgra8Unorm_srgb
+        view.depthStencilPixelFormat = .depth32Float
+        view.delegate = context.coordinator
+        view.preferredFramesPerSecond = 60
+        return view
+    }
 
-            Canvas { graphicsContext, size in
-                let drawPoints = routePoints.map { point in
-                    CGPoint(
-                        x: point.x * size.width * 0.72 + size.width * 0.14,
-                        y: point.y * size.height * 0.72 + size.height * 0.14
-                    )
-                }
+    func updateUIView(_ uiView: MTKView, context: Context) {}
 
-                guard !drawPoints.isEmpty else { return }
+    func makeCoordinator() -> Coordinator {
+        Coordinator(points: RouteScene.build(from: coordinates), palette: palette)
+    }
 
-                // Draw layered fluid strokes
-                for layer in 0..<6 {
-                    let amplitude = 1.8 + Double(layer) * 1.1
-                    let phase = t * (0.8 + Double(layer) * 0.18)
-                    let path = makeFluidPath(points: drawPoints, amplitude: amplitude, phase: phase)
+    final class Coordinator: NSObject, MTKViewDelegate {
+        private let device: MTLDevice
+        private let commandQueue: MTLCommandQueue
+        private let pipelineState: MTLRenderPipelineState
+        private var vertexBuffer: MTLBuffer
+        private var indexBuffer: MTLBuffer
+        private let uniformsBuffer: MTLBuffer
+        private let pointCount: Int
+        private var time: Float = 0
 
-                    let alpha = 0.18 + Double(6 - layer) * 0.09
-                    let width = 12 + CGFloat(layer) * 5.5
+        init(points: [SIMD2<Float>], palette: RoutePalette) {
+            guard let device = MTLCreateSystemDefaultDevice() else {
+                fatalError("Metal not available")
+            }
+            self.device = device
+            self.commandQueue = device.makeCommandQueue()!
 
-                    let color = colorForLayer(layer: layer, alpha: alpha)
-                    graphicsContext.stroke(path, with: .color(color), lineWidth: width)
+            let library = device.makeDefaultLibrary()
+            let pipelineDescriptor = MTLRenderPipelineDescriptor()
+            pipelineDescriptor.vertexFunction = library?.makeFunction(name: "routeVertex")
+            pipelineDescriptor.fragmentFunction = library?.makeFunction(name: "routeFragment")
+            pipelineDescriptor.colorAttachments[0].pixelFormat = .bgra8Unorm_srgb
+            self.pipelineState = try! device.makeRenderPipelineState(descriptor: pipelineDescriptor)
 
-                    let brightColor = colorForLayer(layer: layer, alpha: 0.8)
-                    graphicsContext.stroke(path, with: .color(brightColor), lineWidth: max(1.2, width * 0.18))
-                }
+            let (vertices, indices) = Self.makeMesh(from: points)
+            self.vertexBuffer = device.makeBuffer(bytes: vertices, length: vertices.count * MemoryLayout<RouteVertex>.stride, options: [])!
+            self.indexBuffer = device.makeBuffer(bytes: indices, length: indices.count * MemoryLayout<UInt16>.stride, options: [])!
+            self.pointCount = points.count
 
-                // Core bright line
-                let corePath = makeFluidPath(points: drawPoints, amplitude: 1.2, phase: t * 1.1)
-                graphicsContext.stroke(corePath, with: .color(palette.highlight.opacity(0.98)), lineWidth: 1.8)
+            self.uniformsBuffer = device.makeBuffer(length: MemoryLayout<RouteUniforms>.stride, options: [])!
+            let ptr = uniformsBuffer.contents().bindMemory(to: RouteUniforms.self, capacity: 1)
+            ptr[0] = RouteUniforms(warm: palette.warm, cool: palette.cool, time: 0)
+        }
 
-                // End dot
-                if let end = drawPoints.last {
-                    var dotPath = Path()
-                    dotPath.addEllipse(in: CGRect(x: end.x - 5, y: end.y - 5, width: 10, height: 10))
-                    graphicsContext.fill(dotPath, with: .color(palette.highlight.opacity(0.9)))
+        private static func makeMesh(from points: [SIMD2<Float>]) -> ([RouteVertex], [UInt16]) {
+            guard !points.isEmpty else { return ([], []) }
+
+            var vertices: [RouteVertex] = []
+            var indices: [UInt16] = []
+            let ribbonWidth: Float = 1.3
+            let wallDepth: Float = 1.25
+
+            for i in 0..<points.count {
+                let p = points[i]
+                let prev = i == 0 ? points[0] : points[i - 1]
+                let next = i == points.count - 1 ? points[points.count - 1] : points[i + 1]
+                let tangent = normalize(SIMD2<Float>(next.x - prev.x, next.y - prev.y))
+                let normal = SIMD2<Float>(-tangent.y, tangent.x)
+
+                let topLeft = SIMD3<Float>(p.x - normal.x * ribbonWidth, p.y - normal.y * ribbonWidth, 0)
+                let topRight = SIMD3<Float>(p.x + normal.x * ribbonWidth, p.y + normal.y * ribbonWidth, 0)
+                let bottomLeft = SIMD3<Float>(p.x - normal.x * ribbonWidth, p.y - normal.y * ribbonWidth, -wallDepth)
+                let bottomRight = SIMD3<Float>(p.x + normal.x * ribbonWidth, p.y + normal.y * ribbonWidth, -wallDepth)
+
+                let a = RouteVertex(position: topLeft, uv: SIMD2<Float>(Float(i) / Float(max(points.count - 1, 1)), 0.0))
+                let b = RouteVertex(position: topRight, uv: SIMD2<Float>(Float(i) / Float(max(points.count - 1, 1)), 0.0))
+                let c = RouteVertex(position: bottomLeft, uv: SIMD2<Float>(Float(i) / Float(max(points.count - 1, 1)), 1.0))
+                let d = RouteVertex(position: bottomRight, uv: SIMD2<Float>(Float(i) / Float(max(points.count - 1, 1)), 1.0))
+
+                vertices.append(contentsOf: [a, b, c, d])
+
+                if i < points.count - 1 {
+                    let base = UInt16(i * 4)
+                    indices.append(contentsOf: [
+                        base, base + 1, base + 2,
+                        base + 1, base + 3, base + 2
+                    ])
                 }
             }
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
-            .background(palette.backgroundColor)
-        }
-    }
 
-    private func colorForLayer(layer: Int, alpha: Double) -> Color {
-        let t = Double(layer) / 5.0
-        let clamped = max(0, min(1, t))
-        
-        // Interpolate between warm and cool
-        let warmRGB = (1.0, 0.42, 0.22)
-        let coolRGB = (0.25, 0.80, 0.85)
-        
-        let r = warmRGB.0 + (coolRGB.0 - warmRGB.0) * clamped
-        let g = warmRGB.1 + (coolRGB.1 - warmRGB.1) * clamped
-        let b = warmRGB.2 + (coolRGB.2 - warmRGB.2) * clamped
-        
-        return Color(red: r, green: g, blue: b, opacity: alpha)
-    }
-
-    private func makeFluidPath(points: [CGPoint], amplitude: Double, phase: Double) -> Path {
-        guard points.count > 1 else {
-            return Path()
+            return (vertices, indices)
         }
 
-        var path = Path()
-        var warped: [CGPoint] = []
+        func mtkView(_ view: MTKView, drawableSizeWillChange size: CGSize) {}
 
-        for (index, point) in points.enumerated() {
-            let p = Double(index) / max(Double(points.count - 1), 1.0)
-            let previous = index == 0 ? point : points[index - 1]
-            let next = index == points.count - 1 ? point : points[index + 1]
+        func draw(in view: MTKView) {
+            guard let drawable = view.currentDrawable,
+                  let pass = view.currentRenderPassDescriptor,
+                  let commandBuffer = commandQueue.makeCommandBuffer(),
+                  let encoder = commandBuffer.makeRenderCommandEncoder(descriptor: pass) else {
+                return
+            }
 
-            let dx = next.x - previous.x
-            let dy = next.y - previous.y
-            let angle = atan2(dy, dx)
-            let normalX = -sin(angle)
-            let normalY = cos(angle)
+            time += 1.0 / 60.0
 
-            let wave = sin(p * 26.0 + phase * 1.8) * amplitude 
-                     + cos(p * 14.0 - phase * 1.2) * (amplitude * 0.55)
-            let offsetX = normalX * CGFloat(wave)
-            let offsetY = normalY * CGFloat(wave)
+            let ptr = uniformsBuffer.contents().bindMemory(to: RouteUniforms.self, capacity: 1)
+            ptr[0].time = time
 
-            warped.append(CGPoint(x: point.x + offsetX, y: point.y + offsetY))
+            encoder.setRenderPipelineState(pipelineState)
+            encoder.setVertexBuffer(vertexBuffer, offset: 0, index: 0)
+            encoder.setVertexBuffer(uniformsBuffer, offset: 0, index: 1)
+            encoder.drawIndexedPrimitives(type: .triangle, indexCount: indexBuffer.length / MemoryLayout<UInt16>.stride, indexType: .uint16, indexBuffer: indexBuffer, indexBufferOffset: 0)
+            encoder.endEncoding()
+
+            commandBuffer.present(drawable)
+            commandBuffer.commit()
         }
-
-        guard let first = warped.first else { return path }
-        path.move(to: first)
-
-        for i in 1..<warped.count {
-            path.addLine(to: warped[i])
-        }
-
-        return path
     }
 }
 
 #Preview {
     ZStack {
         Color.black.ignoresSafeArea()
-        FluidRouteView(coordinates: SampleRoute.potreroHill)
+        PRAXISRouteView(coordinates: SampleRoute.potreroHill)
             .frame(width: 360, height: 360)
-            .padding()
     }
 }
+
+
+// MARK: - Metal shaders
+
+@MainActor
+private func routeShaderSource() -> String {
+    """
+    #include <metal_stdlib>
+    using namespace metal;
+
+    struct RouteVertex {
+        float3 position;
+        float2 uv;
+    };
+
+    struct RouteUniforms {
+        float4 warm;
+        float4 cool;
+        float time;
+    };
+
+    struct VertexOut {
+        float4 position [[position]];
+        float2 uv;
+    };
+
+    vertex VertexOut routeVertex(uint vid [[vertex_id]],
+                                const device RouteVertex* vertices [[buffer(0)]],
+                                constant RouteUniforms& uniforms [[buffer(1)]]) {
+        RouteVertex v = vertices[vid];
+        float noiseWave = sin(v.uv.x * 28.0 + uniforms.time * 2.5 + v.position.y * 9.0) * 0.12;
+        float3 pos = v.position;
+        pos.z += noiseWave;
+
+        VertexOut out;
+        out.position = float4(pos, 1.0);
+        out.uv = v.uv;
+        return out;
+    }
+
+    fragment float4 routeFragment(VertexOut in [[stage_in]],
+                                 constant RouteUniforms& uniforms [[buffer(0)]]) {
+        float t = in.uv.x;
+        float d = in.uv.y; // 0 = top, 1 = bottom
+
+        float noise = sin((t * 22.0) + (uniforms.time * 1.5)) * 0.45
+                    + cos((t * 12.0) - (uniforms.time * 1.1) + (in.position.y * 4.0)) * 0.2;
+
+        float verticalFade = pow(1.0 - d, 1.8);
+        float edgeBoost = pow(1.0 - d, 4.2);
+
+        float drift = 0.5 + 0.5 * sin(uniforms.time * 0.6 + t * 2.0);
+        float3 tint = mix(uniforms.warm.rgb, uniforms.cool.rgb, drift + noise * 0.3);
+        float3 core = mix(float3(1.0), tint, 0.35 + noise * 0.2);
+        float3 col = mix(tint, core, edgeBoost * 0.8);
+        float alpha = (0.35 + (0.65 * verticalFade)) * (0.75 + noise * 0.6);
+
+        return float4(col * alpha, alpha);
+    }
+    """
+}
+
+// This file intentionally keeps the route geometry and shader pipeline self-contained.
+// If your project already has a Metal library, move the shader functions into `.metal` files and
+// keep this Swift wrapper as the view/controller layer.
